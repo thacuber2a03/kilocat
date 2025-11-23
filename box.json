@@ -1,0 +1,19 @@
+{
+    "name": "kilocat",
+    "version": "v0.1.0",
+    "author": "@thacuber2a03",
+    "license": "Unlicense",
+    "description": "A port of antirez's kilo to Umka + catcurses",
+    "readme": "README.md",
+    "dependencies": [
+        "umka",
+        "fmt",
+        "strings",
+        "catcurses"
+    ],
+    "include": [],
+    "run": {
+        "posix": "./umbox/umka/umka kilo.um",
+        "windows": "echo catcurses can't run on Windows, so this project can't either. & exit 255"
+    }
+}

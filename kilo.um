@@ -1,0 +1,904 @@
+/*
+** a port of Salvatore Sanfilippo's kilo (https://github.com/antirez/kilo)
+** to Umka + catcurses, by x4n3ku (https://thacuber2a03.github.io)
+**
+** based on the Snaptoken tutorial by Paige Ruten @ https://viewsourcecode.org/snaptoken/kilo
+**
+** dedicated to the public domain, or Unlicense (https://unlicense.org) if unapplicable
+**
+** ...hey, it still fits in less than 1k lines!
+*/
+
+import (
+	"std.um"
+
+	"umbox/fmt/fmt.um"
+	"umbox/strings/strings.um"
+
+	cc = "umbox/catcurses/catcurses.um"
+)
+
+const (
+	version = "0.0.1"
+	tabStop = 4
+	maxQuitTimes = 3
+)
+
+type (
+	FaceID = enum { // what is editorHighlight in the tutorial
+		normal
+		comment
+		mlComment
+		keyword1
+		keyword2
+		string
+		number
+		match
+	}
+
+	Syntax = struct {
+		filetype: str
+		filematch: []str
+		keywords: []str
+		singleLineCommentStart: str
+		multilineComment: struct { start, end: str }
+		flags: int
+	}
+
+	Row = struct {
+		idx: int
+		data, render: str
+		hl: []FaceID
+		hlOpenComment: bool 
+	}
+
+	Editor = struct {
+		term: ^cc::Terminal
+		win: weak ^cc::Window
+
+		cx, cy, rx: int
+		screenRows: int
+		rowoff, coloff: int
+		rows: []Row
+		dirty: int
+		filename: str
+		statusMsg: str
+		statusTime: int
+
+		faces: map[FaceID]cc::ColorPairID
+		syntax: ^Syntax
+	}
+)
+
+// I miss iota
+const (
+	highlightNumbers = 1 << 0
+	highlightStrings = 1 << 1
+)
+
+var highlightDatabase: []Syntax
+
+fn isCntrl(c: char): bool { b := uint8(c); return b < 0x1f || b == 0x7f }
+fn isDigit(c: char): bool { b := uint8(c); return b >= 48 && b <= 57 }
+
+fn isSpace(c: char): bool {
+	return c == ' ' || c == '\f' || c == '\n' || c == '\r' || c == '\t' || c == '\v'
+}
+
+// taken from strings.um and modified
+fn contains(inp, check: str): int {
+	if check == "" { return 0 }
+
+	for i := 0; i < len(inp); i++ {
+		for j := 0; i+j < len(inp) && inp[i+j] == check[j] && j < len(check); j++ {
+			if j == len(check) - 1 {
+				return i
+			}
+		}
+	}
+
+	return -1
+}
+
+fn clamp(x, a, b: int): int {
+	if x > b { return b }
+	if x < a { return a }
+	return x
+}
+
+fn (e: ^Editor) exitCleanup() {
+	e.win.clear()
+	e.win.refresh()
+	e.win.setCursorPos(0,0)
+	e.term.destroy()
+}
+
+fn (e: ^Editor) checkScreenSize() {
+	if h := e.win.getHeight(); h != e.screenRows { e.screenRows = h - 2 }
+}
+
+/*** prototypes ***/
+
+fn (e: ^Editor) setStatusMessage(fmt: str, a: ..any)
+fn (e: ^Editor) refreshScreen()
+
+type PromptCallback = fn(query: str, key: cc::Key)
+fn noPromptCallback(query: str, key: cc::Key) {}
+fn (e: ^Editor) prompt(fmt: str, callback: PromptCallback): (str, bool)
+
+/*** syntax highlighting ***/
+
+fn isSeparator(c: char): bool {
+	if isSpace(c) || c == '\0' { return true }
+
+	for _,s in ",.()+-/*=~%<>[];:" {
+		if c == s { return true }
+	}
+	return false
+}
+
+fn (r: ^Row) updateSyntax(e: ^Editor) {
+	if len(r.hl) != len(r.render) {
+		r.hl = make([]FaceID, len(r.render))
+	}
+	for i in r.hl { r.hl[i] = .normal }
+
+	if e.syntax == null { return }
+	syntax := e.syntax
+
+	keywords := syntax.keywords
+	scs := syntax.singleLineCommentStart
+	mcs := syntax.multilineComment.start
+	mce := syntax.multilineComment.end
+
+	prevSep := true
+	inString := '\0'
+	inComment := r.idx > 0 && e.rows[r.idx-1].hlOpenComment
+
+	i := 0
+	for i < len(r.render) {
+		c := r.render[i]
+		prevHL := i > 0 ? r.hl[i-1] : FaceID.normal
+
+		prefix := slice(r.render, i, len(r.render))
+
+		if len(scs) != 0 && inString == '\0' && !inComment {
+			if strings::has_prefix(prefix, scs) {
+				for j := i; j < len(r.hl); j++ { r.hl[j] = .comment }
+				break
+			}
+		}
+
+		if len(mcs) > 0 && len(mce) > 0 && inString == '\0' {
+			if inComment {
+				r.hl[i] = .mlComment
+				if strings::has_prefix(prefix, mce) {
+					for j := i; j < i+len(mce); j++ { r.hl[j] = .mlComment }
+					i += len(mce)
+					inComment = false
+					prevSep = true
+					continue
+				}
+				i++
+				continue
+			} else if strings::has_prefix(prefix, mcs) {
+				for j := i; j < i+len(mcs); j++ { r.hl[j] = .mlComment }
+				i += len(mcs)
+				inComment = true
+				continue
+			}
+		}
+
+		if syntax.flags & highlightStrings != 0 {
+			if inString != '\0' {
+				r.hl[i] = .string
+				if c == '\\' && i+1 < len(r.render) {
+					r.hl[i+1] = .string
+					i += 2
+					continue
+				}
+				if c == inString { inString = '\0' }
+				i++
+				prevSep = true
+				continue
+			} else if c == '"' || c == '\'' {
+				inString = c
+				r.hl[i] = .string
+				i++
+				continue
+			}
+		}
+
+		if syntax.flags & highlightNumbers != 0 {
+			if (isDigit(c) && (prevSep || prevHL == .number)) ||
+			   (c == '.' && prevHL == .number) {
+				r.hl[i] = .number
+				i++
+				prevSep = false
+				continue
+			}
+		}
+
+		if prevSep {
+			matched := false
+			for _, kw in keywords {
+				kw2 := false
+				if kw[len(kw)-1] == '|' {
+					kw2 = true
+					kw = slice(kw, 0, -1)
+				}
+				if strings::has_prefix(prefix, kw) {
+					e := i+len(kw)
+					nextChar := e < len(r.render) ? r.render[e] : '\0'
+					if isSeparator(nextChar) {
+						for j := i; j < i+len(kw); j++ {
+							r.hl[j] = kw2 ? FaceID.keyword2 : FaceID.keyword1
+						}
+						i += len(kw)
+						matched = true
+						break
+					}
+				}
+			}
+			if matched {
+				prevSep = false
+				continue
+			}
+		}
+
+		prevSep = isSeparator(c)
+		i++
+	}
+
+	changed := r.hlOpenComment != inComment
+	r.hlOpenComment = inComment
+	if changed && r.idx+1 < len(e.rows) {
+		e.rows[r.idx+1].updateSyntax(e)
+	}
+}
+
+fn (e: ^Editor) selectSyntaxHighlight() {
+	e.syntax = null
+	if e.filename == "" { return }
+
+	sp := strings::split(e.filename, ".")
+	ext := "." + sp[len(sp)-1]
+
+	for _, s^ in highlightDatabase {
+		i := 0
+		for i < len(s.filematch) {
+			fm := s.filematch[i]
+			isExt := fm[0] == '.'
+			if (isExt && ext != "" && ext == fm) ||
+			   (!isExt && contains(e.filename, fm) == 0) {
+				e.syntax = s
+				for filerow := 0; filerow < len(e.rows); filerow++ {
+					e.rows[filerow].updateSyntax(e)
+				}
+				return
+			}
+			i++
+		}
+	}
+}
+
+/*** row operations ***/
+
+fn (r: ^Row) cxToRx(cx: int): int {
+	rx := 0
+	for j := 0; j < cx; j++ {
+		if r.data[j] == '\t' { rx += (tabStop - 1) - (rx % tabStop) }
+		rx++
+	}
+	return rx
+}
+
+fn (r: ^Row) rxToCx(rx: int): int {
+	curRx := 0
+	for i,c in r.data {
+		if c == '\t' { curRx += (tabStop - 1) - (curRx % tabStop) }
+		curRx++
+		if curRx > rx { return i }
+	}
+	return len(r.data)
+}
+
+fn (r: ^Row) update(e: ^Editor) {
+	tabs := 0
+	for _,c in r.data { if c == '\t' { tabs++ } }
+
+	r.render = ""
+	for i,c in r.data {
+		if c == '\t' {
+			// because rendering tabs as spaces with no underlying replacement characters is basically torture
+			r.render += '|'
+			for len(r.render) % tabStop != 0 { r.render += ' ' }
+		} else {
+			r.render += c
+		}
+	}
+
+	r.updateSyntax(e)
+}
+
+fn (e: ^Editor) insertRow(at: int, s: str) {
+	if at < 0 || at > len(e.rows) { return }
+	r := Row{data: s, idx: at}
+	r.update(e)
+	e.rows = insert(e.rows, at, r)
+	for j := at+1; j < len(e.rows); j++ { e.rows[j].idx++ }
+	e.dirty++
+}
+
+fn (e: ^Editor) deleteRow(at: int) {
+	if at < 0 || at >= len(e.rows) { return }
+	e.rows = delete(e.rows, at)
+	for j := at; j < len(e.rows); j++ { e.rows[j].idx++ }
+	e.dirty++
+}
+
+fn (e: ^Editor) rowInsertChar(r: ^Row, at: int, c: char) {
+	if at < 0 || at > len(r.data) { at = len(r.data) }
+	r.data = str(insert([]char(r.data), at, c))
+	r.update(e)
+	e.dirty++
+}
+
+fn (e: ^Editor) rowAppendString(r: ^Row, s: str) {
+	r.data += s
+	r.update(e)
+	e.dirty++
+}
+
+fn (e: ^Editor) rowDeleteChar(r: ^Row, at: int) {
+	if at < 0 || at >= len(r.data) { return }
+	r.data = str(delete([]char(r.data), at))
+	r.update(e)
+	e.dirty++
+}
+
+/*** editor operations ***/
+
+fn (e: ^Editor) insertChar(c: char) {
+	if e.cy == len(e.rows) { e.insertRow(len(e.rows), "") }
+	e.rowInsertChar(&e.rows[e.cy], e.cx, c)
+	e.cx++
+}
+
+fn (e: ^Editor) insertNewline() {
+	if e.cx == 0 {
+		e.insertRow(e.cy, "")
+	} else {
+		row := &e.rows[e.cy]
+		e.insertRow(e.cy+1, slice(row.data, e.cx, len(row.data)))
+		row = &e.rows[e.cy]
+		row.data = slice(row.data, 0, e.cx)
+		row.update(e)
+	}
+	e.cy++
+	e.cx = 0
+}
+
+fn (e: ^Editor) deleteChar() {
+	if e.cy == len(e.rows)    { return }
+	if e.cx == 0 && e.cy == 0 { return }
+
+	row := &e.rows[e.cy]
+	if e.cx > 0 {
+		e.rowDeleteChar(row, e.cx - 1)
+		e.cx--
+	} else {
+		e.cx = len(e.rows[e.cy - 1].data)
+		e.rowAppendString(&e.rows[e.cy - 1], row.data)
+		e.deleteRow(e.cy)
+		e.cy--
+	}
+}
+
+/*** file i/o ***/
+
+fn (e: ^Editor) getline(f: std::File): (str, bool) {
+	var s: str
+
+	for true {
+		var c: char
+		n, err := std::fread(f, &c)
+		if n != 1 {
+			if std::StdErr(err.code) != .eof {
+				e.exitCleanup()
+				std::assert(false)
+			}
+			if len(s) == 0 { return "", false }
+			break
+		}
+		if c == '\n' { break }
+		s += c
+	}
+
+	return s, true
+}
+
+fn (e: ^Editor) open(filename: str) {
+	e.filename = filename
+	f, err := std::fopen(filename, "r")
+	if err.code != 0 {
+		e.setStatusMessage("Couldn't open file! I/O error: {}", err.msg)
+		return
+	}
+
+	e.selectSyntaxHighlight()
+
+	for true {
+		line, ok := e.getline(f)
+		if !ok { break }
+		e.insertRow(len(e.rows), line)
+	}
+
+	std::fclose(f)
+	e.dirty = 0
+}
+
+stdErrMsg := []str{
+	"",
+	"Assertion failed",
+	"Wrong buffer size",
+	"Pointers cannot be read or written",
+	"File is null",
+	"End of file"
+}
+
+fn (e: ^Editor) save() {
+	if e.filename == "" {
+		if filename, ok := e.prompt("Save as: {}", noPromptCallback); ok {
+			e.filename = filename
+			e.selectSyntaxHighlight()
+		} else {
+			e.setStatusMessage("Save aborted")
+			return
+		}
+	}
+
+	var contents: str
+	for _, r in e.rows { contents += r.data + "\n" }
+
+	f, err := std::fopen(e.filename, "w+b")
+	if err.code != 0 { return }
+
+	n, err := std::fwrite(f, []char(contents))
+	std::fclose(f)
+	if err.code != 0 {
+		e.setStatusMessage("Can't save! I/O error: {}", stdErrMsg[err.code])
+	} else {
+		e.dirty = 0
+		e.setStatusMessage("{} bytes written to disk", len(contents))
+	}
+}
+
+/*** find ***/
+
+var (
+	lastMatch, direction: int = -1, 1
+	savedHLLine: int = 0
+	savedHL: []FaceID
+	hasSavedHL: bool
+)
+
+fn (e: ^Editor) findCallback(query: str, key: cc::Key) {
+	if hasSavedHL {
+		e.rows[savedHLLine].hl = savedHL
+		hasSavedHL = false
+	}
+
+	if key == .enter || key == .escape {
+		lastMatch, direction = -1, 1
+		return
+	} else if key == .right || key == .down {
+		direction = 1
+	} else if key == .left || key == .up {
+		direction = -1
+	} else {
+		lastMatch, direction = -1, 1
+	}
+
+	if lastMatch == -1 { direction = 1 }
+	current := lastMatch
+	for i := 0; i < len(e.rows); i++ {
+		current += direction
+
+		if current == -1          { current = len(e.rows)-1 }
+		if current == len(e.rows) { current = 0 }
+
+		row := e.rows[current]
+		if match := contains(row.render, query); match != -1 {
+			lastMatch = current
+			e.cy = current
+			e.cx = row.rxToCx(match)
+			e.rowoff = len(e.rows)
+
+			savedHLLine = current
+			savedHL = copy(row.hl)
+			hasSavedHL = true
+
+			for i := 0; i < len(query); i++ { row.hl[match+i] = .match }
+			break
+		}
+	}
+}
+
+fn (e: ^Editor) find() {
+	cx, cy, coloff, rowoff := e.cx, e.cy, e.coloff, e.rowoff
+
+	if query, ok := e.prompt(
+		"Search: {} (Use ESC/Arrows/Enter)",
+		|e| { e.findCallback(query, key) }
+	); !ok {
+		e.cx, e.cy, e.coloff, e.rowoff = cx, cy, coloff, rowoff
+	}
+}
+
+/*** output ***/
+
+fn (e: ^Editor) scroll() {
+	e.rx = 0
+	if e.cy < len(e.rows) { e.rx = e.rows[e.cy].cxToRx(e.cx) }
+
+	w, h := e.win.getWidth(), e.screenRows
+	if e.cy <  e.rowoff     { e.rowoff = e.cy }
+	if e.cy >= e.rowoff + h { e.rowoff = e.cy - h + 1 }
+	if e.rx <  e.coloff     { e.coloff = e.rx }
+	if e.rx >= e.coloff + w { e.coloff = e.rx - w + 1 }
+}
+
+fn (e: ^Editor) drawRows() {
+	w, h := e.win.getWidth(), e.screenRows
+	for y := 0; y < h; y++ {
+		cursorLine := e.win.getCursorY()
+
+		filerow := y + e.rowoff
+		if filerow >= len(e.rows) {
+			if len(e.rows) == 0 && y == e.screenRows/3 {
+				welcome := "Kilo editor -- version " + version
+				if len(welcome) > e.win.getWidth() { welcome = slice(welcome, 0, e.win.getWidth()) }
+				padding := (e.win.getWidth() - len(welcome))/2
+				if padding > 0 {
+					e.win.writeString("~")
+					padding--
+				}
+				for padding > 0 {
+					e.win.writeString(" ")
+					padding--
+				}
+				e.win.writeString(welcome)
+			} else {
+				e.win.writeString("~")
+			}
+		} else {
+			row := e.rows[filerow]
+			coloff := clamp(e.coloff, 0, len(row.render))
+
+			rowlen := clamp(len(row.render) - coloff, 0, e.win.getWidth())
+
+			c := slice(row.render, coloff, coloff+rowlen)
+			hl := slice(row.hl, coloff, coloff+rowlen)
+
+			currentFace := FaceID.normal
+
+			for j := 0; j < rowlen; j++ {
+				ch, face := c[j], hl[j]
+				if isCntrl(ch) {
+					sym := uint8(ch) <= 26 ? char(uint8('@') + uint8(ch)) : '?'
+					e.win.withAttrs({.reverse}, |sym| { win.writeChar(sym) })
+				} else if face == .normal {
+					if currentFace != .normal {
+						e.win.useColorPair(e.faces[.normal])
+						currentFace = .normal
+					}
+					e.win.writeChar(ch)
+				} else {
+					if face != currentFace {
+						currentFace = face
+						e.win.useColorPair(e.faces[face]) 
+					}
+					e.win.writeChar(ch)
+				}
+			}
+			e.win.useColorPair(e.faces[.normal])
+		}
+
+		e.win.clearToEOL()
+		e.win.setCursorPos(0, cursorLine+1) // ugh
+	}
+}
+
+fn (e: ^Editor) drawStatusBar() {
+	e.win.withAttrs({.reverse}, |e| {
+		status := sprintf(
+			"%.20s - %d lines %s",
+			e.filename != "" ? e.filename : "[unnamed]",
+			len(e.rows),
+			e.dirty != 0 ? "(modified)" : ""
+		)
+		l := len(status)
+		rstatus := sprintf(
+			"%s | %d/%d (%.2f%%)",
+			e.syntax != null ? e.syntax.filetype : "no ft",
+			e.cy+1, len(e.rows),
+			len(e.rows) == 0 ? 0.0 : real(e.cy)/(len(e.rows)-1)*100
+		)
+		rl := len(rstatus)
+		if l > e.win.getWidth() { l = e.win.getWidth() }
+		win.writeString(status)
+		for l < e.win.getWidth() {
+			if e.win.getWidth() - l == rl {
+				e.win.writeString(rstatus)
+				break
+			} else {
+				win.writeString(" ")
+				l++
+			}
+		}
+	})
+	e.win.writeString("\n")
+}
+
+fn (e: ^Editor) drawMessageBar() {
+	// required before EOL, due to ncurses idiosyncracies
+	e.win.setCursorPos(0, e.win.getCursorY())
+	e.win.clearToEOL()
+	l := len(e.statusMsg)
+	if l > e.win.getWidth() { l = e.win.getWidth() }
+	if l != 0 && std::time() - e.statusTime < 5 {
+		e.win.writeString(e.statusMsg, l)
+	}
+}
+
+fn (e: ^Editor) refreshScreen() {
+	e.checkScreenSize()
+	e.scroll()
+
+	e.win.setCursorPos(0,0)
+	e.drawRows()
+	e.drawStatusBar()
+	e.drawMessageBar()
+	e.win.setCursorPos(e.rx - e.coloff, e.cy - e.rowoff)
+}
+
+fn (e: ^Editor) setStatusMessage(fmt: str, a: ..any) {
+	e.statusMsg = fmt::vsfmt(fmt, a)
+	e.statusTime = std::time()
+}
+
+/*** input ***/
+
+const (
+	quitKey      = cc::Key('q')
+	reloadKey    = cc::Key('l')
+	altDeleteKey = cc::Key('h')
+	saveKey      = cc::Key('s')
+	findKey      = cc::Key('f')
+)
+
+fn (e: ^Editor) prompt(fmt: str, callback: PromptCallback): (str, bool) {
+	var buf: str
+
+	for true {
+		e.setStatusMessage(fmt, buf)
+		e.refreshScreen()
+
+		k, err := e.win.getKey()
+		std::exitif(err)
+
+		if k == .delete || k == .backspace|| k == cc::ctrlKey(altDeleteKey) {
+			if len(buf) != 0 { buf = slice(buf, 0, -1) }
+		} else if k == .escape {
+			e.setStatusMessage("")
+			if valid(callback) { callback(buf, k) }
+			return buf, false
+		} else if k == .enter && len(buf) != 0 {
+			if valid(callback) { callback(buf, k) }
+			// Umka's reference implementation requires the last statement in a function block
+			// to be a return if the function returns a non-void type, so pretend this is
+			// just the final code below
+			break 
+		} else if int(k) < 128 && !isCntrl(char(k)) {
+			buf += char(k)
+		}
+
+		if valid(callback) { callback(buf, k) }
+	}
+
+	e.setStatusMessage("")
+	return buf, true
+}
+
+fn (e: ^Editor) moveCursor(k: cc::Key) {
+	row := e.cy >= len(e.rows) ? ^Row(null) : &e.rows[e.cy]
+
+	switch k {
+	case .left:
+		if e.cx != 0 {
+			e.cx-- 
+		} else if e.cy > 0 {
+			e.cy--
+			e.cx = len(e.rows[e.cy].data)
+		}
+
+	case .right:
+		if row != null {
+			if e.cx < len(row.data) {
+				e.cx++ 
+			} else if e.cx == len(row.data) {
+				e.cy++
+				e.cx = 0
+			}
+		}
+
+	case .up:   if e.cy != 0          { e.cy-- }
+	case .down: if e.cy < len(e.rows) { e.cy++ }
+	}
+
+	row = e.cy >= len(e.rows) ? ^Row(null) : &e.rows[e.cy]
+	rowlen := row != null ? len(row.data) : 0
+	if e.cx > rowlen { e.cx = rowlen }
+}
+
+quitTimes := maxQuitTimes
+
+fn (e: ^Editor) processKeypress() {
+	k, err := e.win.getKey()
+
+	if k == cc::ctrlKey(quitKey) {
+		if e.dirty != 0 && quitTimes > 0 {
+			e.setStatusMessage("WARNING!!! File has unsaved changes. Press Ctrl-Q {} more times to quit.", quitTimes)
+			quitTimes--
+			return
+		}
+		e.exitCleanup()
+		exit(0)
+
+	// refresh
+	} else if k == cc::ctrlKey(reloadKey) || k == .escape { return
+
+	} else if k == cc::ctrlKey(altDeleteKey) { e.deleteChar()
+	} else if k == cc::ctrlKey(saveKey)      { e.save()
+	} else if k == cc::ctrlKey(findKey)      { e.find()
+
+	} else {
+		switch k {
+		case .enter:
+			e.insertNewline()
+
+		case .home: e.cx = 0
+
+		case .end:
+			if e.cy < len(e.rows) { e.cx = len(e.rows[e.cy].data) }
+
+		case .backspace, .delete:
+			if k == .delete { e.moveCursor(.right) }
+			e.deleteChar()
+
+		case .pageUp, .pageDown:
+			if k == .pageUp {
+				e.cy = e.rowoff
+			} else if k == .pageDown {
+				e.cy = e.rowoff + e.screenRows - 1
+				if e.cy > len(e.rows) { e.cy = len(e.rows) }
+			}
+
+			for times := e.screenRows; times > 0; times-- {
+				e.moveCursor(k == .pageUp ? cc::Key.up : cc::Key.down)
+			}
+
+		case .up, .down, .left, .right:
+			e.moveCursor(k)
+
+		case .escape:
+			// nothing
+
+		default:
+			// don't willingly insert unprintable characters
+			// ...I thought it was obvious enough
+			if int(k) < 128 && (!isCntrl(char(k)) || k == .tab) { e.insertChar(char(k)) }
+		}
+	}
+
+	quitTimes = maxQuitTimes
+}
+
+const fpms = floor(1.0/60.0*1000)
+
+fn init() {
+	highlightDatabase = {
+		{
+			filetype: "umka",
+			filematch: {".um"},
+			keywords: {
+				"break", "case", "const", "continue", "default",
+				"else", "enum", "fn", "for", "import", "interface",
+				"if", "in", "map", "return", "struct", "switch",
+				"type", "var", "weak",
+
+				"void|",
+				"int8|", "int16|", "int32|", "int|",
+				"uint8|", "uint16|", "uint32|", "uint|",
+				"bool|",
+				"char|",  "str|",
+				"real32|", "real|",
+				"fiber|", "any|",
+				"__file|",
+			},
+			singleLineCommentStart: "//",
+			multilineComment: { "/*", "*/" },
+			flags: highlightNumbers | highlightStrings,
+		},
+		{ // bonus(?): C syntax highlighting
+			filetype: "c",
+			filematch: {".c", ".h"},
+			keywords: {
+				"asm", "break", "case", "continue", "default", "do", "else", "for",
+				"goto", "if", "return", "sizeof", "switch", "while", "offsetof", "alignas",
+				"alignof",
+
+				// cause yeah sure why not
+				"#include|", "#define|", "#ifdef|", "#ifndef|", "#endif|",
+
+				// I copied this whole list of types from Kakoune's `rc/filetype/c-family.kak`
+				"char|", "double|", "float|", "int|", "long|", "short|", "signed|", "unsigned|", "void|", "complex|", "imaginary|", "fenv_t|",
+				"fexcept_t|", "imaxdiv_t|", "lconv|", "float_t|", "double_t|", "jmp_buf|", "sig_atomic_t|", "va_list|", "memory_order|", "atomic_flag|",
+				"atomic_bool|", "atomic_char|", "atomic_schar|", "atomic_uchar|", "atomic_wchar|", "atomic_short|", "atomic_ushort|", "atomic_int|",
+				"atomic_uint|", "atomic_long|", "atomic_llong|", "atomic_ulong|", "atomic_ullong|", "atomic_char16_t|", "atomic_char32_t|", "atomic_intptr_t|",
+				"atomic_intmax_t|", "atomic_int8_t|", "atomic_int16_t|", "atomic_int32_t|", "atomic_int64_t|", "atomic_int_least8_t|", "atomic_int_least16_t|",
+				"atomic_int_least32_t|", "atomic_int_least64_t|", "atomic_int_fast8_t|", "atomic_int_fast16_t|", "atomic_int_fast32_t|", "atomic_int_fast64_t|",
+				"atomic_uintptr_t|", "atomic_uintmax_t|", "atomic_uint8_t|", "atomic_uint16_t|", "atomic_uint32_t|", "atomic_uint64_t|", "atomic_uint_least8_t|",
+				"atomic_uint_least16_t|", "atomic_uint_least32_t|", "atomic_uint_least64_t|", "atomic_uint_fast8_t|", "atomic_uint_fast16_t|", "atomic_uint_fast32_t|",
+				"atomic_uint_fast64_t|", "atomic_size_t|", "atomic_ptrdiff_t|", "bool|", "ptrdiff_t|", "size_t|", "max_align_t|", "wchar_t|", "intptr_t|", "intmax_t|",
+				"int8_t|", "int16_t|", "int32_t|", "int64_t|", "int_least8_t|", "int_least16_t|", "int_least32_t|", "int_least64_t|", "int_fast8_t|", "int_fast16_t|",
+				"int_fast32_t|", "int_fast64_t|", "uintptr_t|", "uintmax_t|", "uint8_t|", "uint16_t|", "uint32_t|", "uint64_t|", "uint_least8_t|", "uint_least16_t|",
+				"uint_least32_t|", "uint_least64_t|", "uint_fast8_t|", "uint_fast16_t|", "uint_fast32_t|", "uint_fast64_t|", "FILE|", "fpos_t|", "div_t|", "ldiv_t|",
+				"lldiv_t|", "cnd_t|", "thrd_t|", "thrd_start_t|", "tss_t|", "tss_dtor_t|", "mtx_t|", "once_flag|", "clock_t|", "time_t|", "timespec|", "tm|", "mbstate_t|",
+				"wint_t|", "wctrans_t|", "wctype_t|", "char16_t|", "char32_t|", "ssize_t|", "gid_t|", "uid_t|", "off_t|", "off64_t|", "useconds_t|", "pid_t|", "socklen_t|",
+			},
+			singleLineCommentStart: "//",
+			multilineComment: { "/*", "*/" },
+			flags: highlightNumbers | highlightStrings,
+		},
+	}
+}
+
+fn initEditor(): ^Editor {
+	e := new(Editor)
+
+	term := cc::stdTerminal()
+	if term.supportsColors() { term.enableColors() }
+	term.raw(true)
+	term.echo(false)
+	term.nl(false)
+	term.escapeDelay(fpms)
+	e.term = term
+
+	e.win = &term.window
+	e.win.keypad(true)
+
+	e.faces[.normal]    = term.addColorPair(.black, .white)
+	e.faces[.comment]   = term.addColorPair(.black, .brightCyan)
+	e.faces[.mlComment] = term.addColorPair(.black, .brightCyan)
+	e.faces[.keyword1]  = term.addColorPair(.black, .yellow)
+	e.faces[.keyword2]  = term.addColorPair(.black, .green)
+	e.faces[.string]    = term.addColorPair(.black, .magenta)
+	e.faces[.number]    = term.addColorPair(.black, .red)
+	e.faces[.match]     = term.addColorPair(.black, .cyan)
+
+	return e
+}
+
+fn main() {
+	init()
+	e := initEditor()
+	e.setStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find")
+	if std::argc() >= 2 { e.open(std::argv(1)) }
+
+	for true {
+		e.refreshScreen()
+		e.processKeypress()
+	}
+}
