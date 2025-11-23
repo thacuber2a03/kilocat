@@ -9,7 +9,7 @@ Besides syntax highlighting in multiline comments breaking down if you so much a
 
 ## Building
 
-Requires [UmBox](https://umbox.tophat2d.dev). (Currently does not work; the `catcurses` box isn't registered in the UmBox website yet)
+Requires [UmBox](https://umbox.tophat2d.dev).
 
 Run `umbox update` and `umbox run`.
 
