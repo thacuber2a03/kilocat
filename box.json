@@ -11,7 +11,7 @@
         "strings",
         "catcurses"
     ],
-    "include": [],
+    "include": ["this is not supposed to be built as a box"],
     "run": {
         "posix": "./umbox/umka/umka kilo.um",
         "windows": "echo catcurses can't run on Windows, so this project can't either. & exit 255"

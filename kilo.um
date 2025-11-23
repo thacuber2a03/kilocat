@@ -831,7 +831,8 @@ fn init() {
 			multilineComment: { "/*", "*/" },
 			flags: highlightNumbers | highlightStrings,
 		},
-		{ // bonus(?): C syntax highlighting
+		// bonus(?): C and JSON highlighters
+		{
 			filetype: "c",
 			filematch: {".c", ".h"},
 			keywords: {
@@ -861,6 +862,11 @@ fn init() {
 			singleLineCommentStart: "//",
 			multilineComment: { "/*", "*/" },
 			flags: highlightNumbers | highlightStrings,
+		},
+		{ // huh... who woulda thought it takes this little to highlight JSON
+			filetype: "json",
+			filematch: {".json"},
+			flags: highlightNumbers | highlightStrings
 		},
 	}
 }
